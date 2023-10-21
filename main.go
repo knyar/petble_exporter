@@ -23,8 +23,8 @@ import (
 var (
 	listen   = flag.String("listen", ":2112", "http addr/port to listen on")
 	addr     = flag.String("addr", "", "bluetooth MAC address of the bowl")
-	sd       = flag.Duration("sd", 1*time.Minute, "scanning duration")
-	interval = flag.Duration("interval", 10*time.Minute, "polling interval")
+	sd       = flag.Duration("sd", 1*time.Minute, "duration of each scanning attempt")
+	interval = flag.Duration("interval", 10*time.Minute, "metric collection interval")
 
 	mBat1     = promauto.NewGauge(prometheus.GaugeOpts{Name: "bowl_battery1_percent"})
 	mBat2     = promauto.NewGauge(prometheus.GaugeOpts{Name: "bowl_battery2_percent"})
@@ -100,7 +100,7 @@ func attempt() (*data, error) {
 
 	log.Printf("Scanning for %s...", *sd)
 	ctx := ble.WithSigHandler(context.WithTimeout(context.Background(), *sd))
-	cln, err := ble.Connect(ctx, func(a ble.Advertisement) bool { return ble.NewAddr(*addr) == a.Addr() })
+	cln, err := ble.Connect(ctx, func(a ble.Advertisement) bool { return ble.NewAddr(*addr).String() == a.Addr().String() })
 	if err != nil {
 		return nil, fmt.Errorf("can't connect: %w", err)
 	}
