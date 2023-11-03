@@ -10,6 +10,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +40,8 @@ var (
 	watchdogTimeout    = 25 * time.Minute
 
 	lastAttemptTime atomic.Value
+
+	mu sync.Mutex
 )
 
 type data struct {
@@ -55,6 +58,8 @@ func main() {
 	}
 
 	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/zero", zeroHandler)
+	http.HandleFunc("/refresh", refreshHandler)
 	go func() {
 		log.Printf("Listening on %s", *listen)
 		log.Fatal(http.ListenAndServe(*listen, nil))
@@ -74,7 +79,7 @@ func main() {
 
 	for {
 		start := time.Now()
-		d, err := attempt()
+		d, err := refresh(log.Printf)
 		mAttempts.Inc()
 		lastAttemptTime.Store(time.Now())
 		if err != nil {
@@ -90,7 +95,61 @@ func main() {
 	}
 }
 
-func attempt() (*data, error) {
+// zeroHandler sends a command to set the scales to zero.
+func zeroHandler(w http.ResponseWriter, r *http.Request) {
+	logf := func(format string, args ...any) {
+		log.Printf(format, args...)
+		w.Write([]byte(fmt.Sprintf(format, args...) + "\n"))
+	}
+	session(logf, []string{"79"}, nil)
+}
+
+// refreshHandler triggers a refresh manually.
+func refreshHandler(w http.ResponseWriter, r *http.Request) {
+	logf := func(format string, args ...any) {
+		log.Printf(format, args...)
+		w.Write([]byte(fmt.Sprintf(format, args...) + "\n"))
+	}
+	refresh(logf)
+}
+
+func refresh(logf func(format string, args ...any)) (*data, error) {
+	cmds := []string{
+		"82",   // some sort of init/hello message.
+		"88",   // request battery level.
+		"8000", // request weight.
+	}
+	result := &data{}
+	h := func(req []byte, last string) {
+		if len(req) == 6 && req[3] == 0x88 && last == "88" {
+			bat := int(req[0])
+			logf("battery level: %d", bat)
+			result.battery2 = bat
+		}
+		if len(req) == 3 && last == "8000" {
+			weight := int16(binary.BigEndian.Uint16(req[1:]))
+			logf("weight: %d", weight)
+			result.weight = int(weight)
+		}
+	}
+
+	stats, err := session(logf, cmds, h)
+	if err != nil {
+		return nil, err
+	}
+	result.battery1 = stats.battery
+	return result, nil
+}
+
+type sessionStats struct {
+	battery int
+}
+
+// session runs a series of commands, calling the callback function on every response.
+func session(logf func(format string, args ...any), cmds []string, h func([]byte, string)) (*sessionStats, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	d, err := linux.NewDevice(ble.OptDialerTimeout(btTimeout), ble.OptListenerTimeout(btTimeout))
 	if err != nil {
 		log.Fatalf("can't init device: %s", err)
@@ -98,14 +157,14 @@ func attempt() (*data, error) {
 	ble.SetDefaultDevice(d)
 	defer d.Stop()
 
-	log.Printf("Scanning for %s, looking for %s...", *sd, *addr)
+	logf("Scanning for %s, looking for %s...", *sd, *addr)
 	ctx := ble.WithSigHandler(context.WithTimeout(context.Background(), *sd))
 	seen := make(map[string]bool)
 	cln, err := ble.Connect(ctx, func(a ble.Advertisement) bool {
 		this := a.Addr().String()
 		good := ble.NewAddr(*addr).String() == this
 		if !seen[this] {
-			log.Printf("Seeing %s; want=%v", a.Addr(), good)
+			logf("Seeing %s; want=%v", a.Addr(), good)
 			seen[this] = true
 		}
 		return good
@@ -114,11 +173,11 @@ func attempt() (*data, error) {
 		return nil, fmt.Errorf("can't connect: %w", err)
 	}
 
-	log.Printf("Connected to %s", cln.Addr())
+	logf("Connected to %s", cln.Addr())
 	done := make(chan struct{})
 	go func() {
 		<-cln.Disconnected()
-		log.Printf("Disconnected from %s", cln.Addr())
+		logf("Disconnected from %s", cln.Addr())
 		close(done)
 	}()
 
@@ -127,7 +186,7 @@ func attempt() (*data, error) {
 		return nil, fmt.Errorf("can't discover services: %s", err)
 	}
 
-	result := &data{}
+	stats := &sessionStats{}
 	for _, s := range svcs {
 		chars, err := cln.DiscoverCharacteristics(nil, s)
 		if err != nil {
@@ -143,12 +202,12 @@ func attempt() (*data, error) {
 				return nil, fmt.Errorf("could not read battery characteristic: %w", err)
 			}
 			bat := int(v[0])
-			log.Printf("battery level: %d", bat)
-			result.battery1 = bat
+			logf("battery level: %d", bat)
+			stats.battery = bat
 			continue
 		}
 		if !s.UUID.Equal(bowlService) || len(chars) == 0 {
-			log.Printf("skipping service %s (%d characteristics)", s.UUID.String(), len(chars))
+			logf("skipping service %s (%d characteristics)", s.UUID.String(), len(chars))
 			continue
 		}
 		char := chars[0]
@@ -161,41 +220,34 @@ func attempt() (*data, error) {
 		}
 
 		var lastSent atomic.Value
-		h := func(req []byte) {
-			log.Printf("Received: %q [% X]", string(req), req)
-			last := lastSent.Load().(string)
-			if len(req) == 6 && req[3] == 0x88 && last == "88" {
-				bat := int(req[0])
-				log.Printf("battery level: %d", bat)
-				result.battery2 = bat
-			}
-			if len(req) == 3 && last == "8000" {
-				weight := int16(binary.BigEndian.Uint16(req[1:]))
-				log.Printf("weight: %d", weight)
-				result.weight = int(weight)
+		subh := func(req []byte) {
+			logf("Received: %q [% X]", string(req), req)
+			if h != nil {
+				last := lastSent.Load().(string)
+				h(req, last)
 			}
 		}
-		if err := cln.Subscribe(char, false, h); err != nil {
+		if err := cln.Subscribe(char, false, subh); err != nil {
 			return nil, fmt.Errorf("subscribe failed: %s", err)
 		}
 		time.Sleep(time.Second)
 
-		msgs := []string{
-			"82",   // some sort of init/hello message.
-			"88",   // request battery level.
-			"8000", // request weight.
-		}
-		for _, msg := range msgs {
-			log.Printf("Writing %s", msg)
-			b, err := hex.DecodeString("0D0A" + msg + "0D0A")
+		for idx, cmd := range cmds {
+			logf("Writing %s", cmd)
+			b, err := hex.DecodeString("0D0A" + cmd + "0D0A")
 			if err != nil {
 				return nil, err
 			}
 			if err := cln.WriteCharacteristic(char, b, true); err != nil {
 				return nil, err
 			}
-			lastSent.Store(msg)
-			time.Sleep(3 * time.Second)
+			lastSent.Store(cmd)
+			if idx < (len(cmds) - 1) {
+				time.Sleep(2 * time.Second)
+			} else {
+				// Wait slightly longer after the last command.
+				time.Sleep(5 * time.Second)
+			}
 		}
 
 		if err := cln.Unsubscribe(char, false); err != nil {
@@ -204,9 +256,9 @@ func attempt() (*data, error) {
 	}
 
 	if err := cln.CancelConnection(); err != nil {
-		log.Printf("CancelConnection returned error: %s", err)
+		logf("CancelConnection returned error: %s", err)
 	}
 
 	<-done
-	return result, nil
+	return stats, nil
 }
