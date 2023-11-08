@@ -89,7 +89,11 @@ func main() {
 		mBat1.Set(float64(d.battery1))
 		mBat2.Set(float64(d.battery2))
 		mWeight.Set(float64(d.weight))
-		mLast.SetToCurrentTime()
+		if time.Now().Year() > 2022 {
+			// Raspberry pi might not have synchronized time yet after a reboot,
+			// so only set the last-update metric if current time is recent enough.
+			mLast.SetToCurrentTime()
+		}
 		time.Sleep(time.Until(start.Add(*interval)))
 	}
 }
