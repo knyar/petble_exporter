@@ -36,8 +36,6 @@ var (
 
 	bowlService        = ble.MustParse("0179bbd0535148b5bf6d2167639bc867")
 	bowlCharacteristic = ble.MustParse("0179bbd1535148b5bf6d2167639bc867")
-	btTimeout          = 10 * time.Minute
-	watchdogTimeout    = 25 * time.Minute
 
 	lastAttemptTime atomic.Value
 
@@ -66,6 +64,7 @@ func main() {
 	}()
 
 	go func() {
+		var watchdogTimeout = *interval * 3
 		for {
 			if la := lastAttemptTime.Load(); la != nil {
 				if time.Since(la.(time.Time)) > watchdogTimeout {
@@ -150,7 +149,7 @@ func session(logf func(format string, args ...any), cmds []string, h func([]byte
 	mu.Lock()
 	defer mu.Unlock()
 
-	d, err := linux.NewDevice(ble.OptDialerTimeout(btTimeout), ble.OptListenerTimeout(btTimeout))
+	d, err := linux.NewDevice(ble.OptDialerTimeout(*interval), ble.OptListenerTimeout(*interval))
 	if err != nil {
 		log.Fatalf("can't init device: %s", err)
 	}
